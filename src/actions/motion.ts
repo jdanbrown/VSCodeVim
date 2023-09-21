@@ -2364,3 +2364,172 @@ export class MoveAroundTag extends MoveTagMatch {
   keys = ['a', 't'];
   override includeTag = true;
 }
+
+// Edge motion, as introduced in https://github.com/t9md/atom-vim-mode-plus
+//  - Our implementation follows the one from atom-vim-mode-plus:
+//    - https://github.com/t9md/atom-vim-mode-plus/blob/v1.36.7/lib/motion.js#L279-L331
+//  - See also the backported version to vim:
+//    - https://github.com/haya14busa/vim-edgemotion/blob/8d16bd92/autoload/edgemotion.vim
+abstract class MoveToEdge extends BaseMovement {
+  override isJump = true;
+
+  abstract up: boolean;
+
+  // TODO TODO
+  //  - [ ] Can we simplify this? How is atom-vmp's implementation so much simpler?
+  //    - https://github.com/t9md/atom-vim-mode-plus/blob/v1.36.7/lib/motion.js#L279-L331
+  //  - [x] `d]` should delete whole lines, not partial lines
+  //  - [x] Oops, `d[` needs opposite 0/eol logic to capture the whole lines
+  //  - [ ] Hmm, `d2]`/`d2[` are totally weird -- go read the code harder
+  //  - [ ] How do we make the cursor end at the getFirstNonWhitespaceCharOnLine instead of column 0?
+  //    - I'm not finding it, might have to ask in the PR
+  //    - [nope, didn't work] Hmm, try last char + 1 and see what that does, maybe it just works
+
+  public override async execAction(
+    position: Position,
+    vimState: VimState,
+    firstIteration: boolean,
+    lastIteration: boolean,
+  ): Promise<Position> {
+    const document = vimState.document;
+
+    const isWhitespaceRegExp = /^\s$/;
+    const isWhitespaceChar = (c: string): boolean => {
+      return isWhitespaceRegExp.test(c);
+    };
+
+    // "Space-filled" means pretend every line extends forever before/after with spaces
+    //  - i.e. return ' ' if column is out of range of line
+    //  - This simplifies some edge-case handling in isGround
+    const spaceFilledCharAt = (line: string, column: number): string => {
+      return line[column] ?? ' ';
+    };
+
+    // In the loops below, we walk until the first/last "ground" position, as defined here
+    const isGround = (pos: Position): boolean => {
+      const line: number = pos.line;
+      const column: number = pos.character;
+      const text: string = document.lineAt(line).text;
+
+      const char: string = spaceFilledCharAt(text, column);
+      const before: string = spaceFilledCharAt(text, column - 1);
+      const after: string = spaceFilledCharAt(text, column + 1);
+
+      if (line < 0 || line >= document.lineCount) {
+        // Assert this doesn't happen
+        throw new Error(
+          `Bug: line[${line}] out of range for document.lineCount[${document.lineCount}]`,
+        );
+      } else if (
+        line === 0 ||
+        line === document.lineCount - 1 ||
+        (line === document.lineCount - 2 && document.lineAt(document.lineCount - 1).text === '')
+      ) {
+        // Any _in-bounds_ position on the first/last line is considered ground, even if it's whitespace
+        //  - This means we will jump to whitespace on the first/last lines, as long as our column isn't past eol
+        return 0 <= column && column < text.length;
+      } else {
+        // Ground is any position that's a non-space char, or has a non-space char before _and_ after:
+        //  - '   ' -- middle char is not ground
+        //  - 'y  ' -- middle char is not ground
+        //  - '  z' -- middle char is not ground
+        //  - 'x z' -- middle char is ground
+        //  - ' y ' -- middle char is ground
+        //  - ' yz' -- middle char is ground
+        //  - 'xy ' -- middle char is ground
+        //  - 'xyz' -- middle char is ground
+        return !isWhitespaceChar(char) || (!isWhitespaceChar(before) && !isWhitespaceChar(after));
+      }
+    };
+
+    // Step a position up/down by one line
+    //  - Return null if the next line would be outside the first/last lines of the document
+    const stepToNextLine = (pos: Position): Position | null => {
+      // Position.translate barfs if the resulting line is negative, so do the bounds check before that
+      const nextLine = pos.line + (this.up ? -1 : 1);
+      if (nextLine < 0 || nextLine >= document.lineCount) {
+        return null;
+      } else {
+        return pos.with({ line: nextLine });
+      }
+    };
+
+    try {
+      const pos1 = position;
+      const pos2 = stepToNextLine(pos1);
+      if (pos2 === null) {
+        // Already at the first/last line of the document, nowhere to go
+        return pos1;
+      } else {
+        // Cases for [pos1, pos2]:
+        //  - Case 1: [ground,  ground]  -- stop at last ground after pos1 (which might be pos2)
+        //  - Case 2: [!ground, ground]  -- stop at first ground after pos1, which here is pos2
+        //  - Case 3: [ground,  !ground] -- stop at first ground after pos1 (somewhere after pos2)
+        //  - Case 4: [!ground, !ground] -- stop at first ground after pos1 (soewheree after pos2)
+        if (isGround(pos1) && isGround(pos2)) {
+          // Case 1: Stop at last ground after pos1 (which might be pos2)
+          //  - Also stop if we step outside the first/last lines of document (stepToNextLine returns null)
+          let lastGround = pos2;
+          let next = stepToNextLine(pos2);
+          while (next !== null && isGround(next)) {
+            lastGround = next;
+            next = stepToNextLine(next);
+          }
+          return lastGround;
+        } else {
+          // Cases 2-4: Stop at first ground after pos1 (which might be pos2)
+          //  - If there isn't any ground after pos1 (we hit the top/bottom of the document), then return pos1 (stay put)
+          let next: Position | null = pos2;
+          while (true) {
+            if (next === null) {
+              return pos1;
+            } else if (isGround(next)) {
+              return next;
+            }
+            next = stepToNextLine(next);
+          }
+        }
+      }
+    } catch (e) {
+      // XXX Debug (calling context catches my errors and 🤷)
+      console.error(e);
+      throw e;
+    }
+  }
+
+  // In operator mode, expand start/end positions to be linewise
+  //  - e.g. `d<leader>]` should delete whole lines, not partial lines on the first/last lines of the motion
+  public override async execActionForOperator(
+    position: Position,
+    vimState: VimState,
+    firstIteration: boolean,
+    lastIteration: boolean,
+  ): Promise<IMovement> {
+    const document = vimState.document;
+    const start = position;
+    const end = await this.execAction(position, vimState, firstIteration, lastIteration);
+    if (!this.up) {
+      return {
+        start: start.with({ character: 0 }),
+        stop: end.with({ character: 0, line: end.line + 1 }),
+      };
+    } else {
+      return {
+        start: end.with({ character: 0 }),
+        stop: start.with({ character: 0, line: start.line + 1 }),
+      };
+    }
+  }
+}
+
+@RegisterAction
+class MoveUpToEdge extends MoveToEdge {
+  keys = ['<leader>', '['];
+  up = true;
+}
+
+@RegisterAction
+class MoveDownToEdge extends MoveToEdge {
+  keys = ['<leader>', ']'];
+  up = false;
+}
